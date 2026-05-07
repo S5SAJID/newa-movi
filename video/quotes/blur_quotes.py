@@ -76,9 +76,14 @@ def create_blur_quote_video(
     #    Sample the bottom 52 % of the frame (where text lives) across 6
     #    frames so the palette reflects the actual text backdrop.
     yield "Extracting theme..."
+    # ← Sample from bg_clip (blurred), NOT the raw clip.
+    #   Blurring averages all pixels into a smooth, uniform tone that is
+    #   completely different from the raw clip's dark shadows / bright highlights.
+    #   Measuring contrast against the wrong source was the root cause of
+    #   unreadable text on warm/golden/green backgrounds.
     theme = FastThemeExtractor.extract_palette(
-        clip,
-        num_colors=8,
+        bg_clip,
+        num_colors=10,
         samples=6,
         text_region="bottom",
         text_region_fraction=0.52,

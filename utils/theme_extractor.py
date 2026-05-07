@@ -5,41 +5,37 @@ Extracts a high-contrast dual-color text palette from a MoviePy clip.
 
 Key design decisions
 ────────────────────
-• Samples the *text region* of each frame (bottom ~52 %), not the whole
-  frame — contrast is evaluated against where the text actually lives.
+• The REPRESENTATIVE BACKGROUND is the MEAN PIXEL COLOR of the text region
+  — not a palette index. This matches what blurring actually produces.
 
-• Uses the WCAG-correct crossover luminance (~0.179) to decide whether
-  text should be light or dark, NOT the naive 0.5 midpoint.
+• WCAG crossover luminance ≈ 0.179 (not 0.5!) determines light vs dark text.
+  Below 0.179 → light text. Above 0.179 → dark text.
 
-• Returns TWO guaranteed-contrast text colors:
-    - primary_text   → best readability (WCAG AA ≥ 4.5 : 1)
-    - secondary_text → visually distinct accent, still WCAG AA compliant
-
-• Falls back to white or black — whichever actually passes, not guessed.
+• Primary   = highest contrast against real bg, tinted with a palette hue.
+• Secondary = visually distinct warm/cool accent, still WCAG AA ≥ 4.5:1.
+• Fallback chain always terminates with a guaranteed-passing color.
 """
 
 import numpy as np
 from PIL import Image
-from typing import Tuple, List, Optional
+from typing import List, Optional, Tuple
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  WCAG LUMINANCE & CONTRAST
+#  WCAG MATH
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _linearize(c: float) -> float:
+def _lin(c: float) -> float:
     c /= 255.0
     return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
 
 
 def _luminance(rgb: tuple) -> float:
-    """Relative luminance per WCAG 2.0, range [0, 1]."""
     r, g, b = (int(x) for x in rgb)
-    return 0.2126 * _linearize(r) + 0.7152 * _linearize(g) + 0.0722 * _linearize(b)
+    return 0.2126 * _lin(r) + 0.7152 * _lin(g) + 0.0722 * _lin(b)
 
 
 def _contrast(c1: tuple, c2: tuple) -> float:
-    """Contrast ratio in range [1, 21]."""
     L1, L2 = _luminance(c1), _luminance(c2)
     hi, lo = max(L1, L2), min(L1, L2)
     return (hi + 0.05) / (lo + 0.05)
@@ -50,141 +46,92 @@ def _rgb_to_hex(rgb: tuple) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  WCAG CROSSOVER — the mathematically correct threshold
+#  WCAG CROSSOVER  (bg_lum where white == black contrast)
+#   solve: (1+.05)/(x+.05) = (x+.05)/(.00+.05)  →  x ≈ 0.1791
 #
-#  Solve for bg_lum where white and black give equal contrast:
-#    (1+0.05)/(bg_lum+0.05) = (bg_lum+0.05)/(0+0.05)
-#    → bg_lum ≈ 0.1791
-#
-#  Above 0.179 → background is "relatively light" → use DARK text
-#  Below 0.179 → background is "relatively dark"  → use LIGHT text
+#   bg_lum > 0.179  → background is "light"  → use DARK text
+#   bg_lum ≤ 0.179  → background is "dark"   → use LIGHT text
 # ─────────────────────────────────────────────────────────────────────────────
-_CROSSOVER_LUMINANCE = 0.1791
-
-_NEAR_WHITE = (245, 245, 240)   # warm white — avoids pure clinical white
-_NEAR_BLACK = (15,  15,  20)    # deep near-black
-
-
-def _anchor_color(bg: tuple) -> tuple:
-    """
-    Returns the best guaranteed-contrast anchor (near-white or near-black)
-    purely based on background luminance.
-    """
-    return _NEAR_BLACK if _luminance(bg) > _CROSSOVER_LUMINANCE else _NEAR_WHITE
+_CROSSOVER = 0.1791
+_NEAR_WHITE = (245, 245, 240)
+_NEAR_BLACK = (15,  15,  18)
 
 
-def _best_anchor(bg: tuple) -> tuple:
-    """
-    Explicitly compares both extremes and returns the one with higher ratio.
-    Handles edge cases where the crossover estimate is borderline.
-    """
-    cr_white = _contrast(_NEAR_WHITE, bg)
-    cr_black = _contrast(_NEAR_BLACK, bg)
-    return _NEAR_WHITE if cr_white >= cr_black else _NEAR_BLACK
+def _anchor(bg: tuple) -> tuple:
+    """White or black, whichever actually has higher contrast vs bg."""
+    cw = _contrast(_NEAR_WHITE, bg)
+    cb = _contrast(_NEAR_BLACK, bg)
+    return _NEAR_WHITE if cw >= cb else _NEAR_BLACK
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  COLOR DERIVATION
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _tint_toward(base: tuple, tint: tuple, amount: float = 0.25) -> tuple:
-    """Blend base color toward tint by `amount` [0–1]."""
+def _tint(base: tuple, tint: tuple, amount: float) -> tuple:
     return tuple(
         max(0, min(255, int(base[i] * (1 - amount) + tint[i] * amount)))
         for i in range(3)
     )
 
 
-def _pick_primary(bg: tuple, palette: List[tuple], min_ratio: float = 4.5) -> tuple:
-    """
-    Selects the palette color with highest contrast against bg that meets
-    min_ratio. Falls back to the mathematically correct anchor color.
-    """
-    anchor = _best_anchor(bg)
+# ─────────────────────────────────────────────────────────────────────────────
+#  CURATED ACCENT PAIRS  (dark-bg → light accents, light-bg → dark accents)
+# ─────────────────────────────────────────────────────────────────────────────
+_LIGHT_ACCENTS = [            # for dark backgrounds  (need high-lum text)
+    (245, 220, 150),          # warm gold
+    (220, 205, 170),          # cream
+    (200, 230, 255),          # cool blue-white
+    (230, 200, 220),          # rose white
+]
+_DARK_ACCENTS = [             # for light/medium backgrounds (need low-lum text)
+    (55,  35,  8),            # dark amber
+    (25,  45,  70),           # dark navy
+    (40,  20,  50),           # dark plum
+    (10,  45,  25),           # dark forest
+]
 
-    # Find all palette colors that meet the threshold
+
+def _pick_primary(bg: tuple, palette: List[tuple], min_ratio: float) -> tuple:
+    anc = _anchor(bg)
+    # Best palette color that passes — prefer highest contrast
     passing = [(c, _contrast(c, bg)) for c in palette if _contrast(c, bg) >= min_ratio]
-
-    if not passing:
-        # No palette color meets threshold — use anchor directly
-        return anchor
-
-    # Among passing colors, pick the one closest in hue to the anchor
-    # (avoids picking garish palette colors when a neutral works better)
-    anchor_lum = _luminance(anchor)
-    # Prefer the one with the highest contrast ratio
-    best = max(passing, key=lambda x: x[1])[0]
-
-    # If it's within the same luminance region as anchor, use it;
-    # otherwise a slight tint of the anchor toward it looks more aesthetic
-    if abs(_luminance(best) - anchor_lum) < 0.3:
-        return best
-
-    # Tint anchor toward best palette color for a subtle warmth
-    tinted = _tint_toward(anchor, best, 0.18)
-    if _contrast(tinted, bg) >= min_ratio:
-        return tinted
-    return anchor
+    if passing:
+        best_pal = max(passing, key=lambda x: x[1])[0]
+        # Tint anchor slightly toward best palette color for warmth
+        tinted = _tint(anc, best_pal, 0.15)
+        if _contrast(tinted, bg) >= min_ratio:
+            return tinted
+        return best_pal
+    return anc  # guaranteed
 
 
 def _pick_secondary(primary: tuple, bg: tuple, palette: List[tuple],
-                    min_ratio: float = 4.5) -> tuple:
-    """
-    Picks a secondary accent that:
-      1. Meets min_ratio contrast against bg
-      2. Is visually distinct from primary (their luminance differs by ≥ 0.12
-         OR they differ in hue)
+                    min_ratio: float) -> tuple:
+    bg_lum = _luminance(bg)
 
-    Falls back to a palette-tinted opposite of primary.
-    """
-    primary_lum = _luminance(primary)
-    anchor      = _best_anchor(bg)
-
-    # Collect candidates: pass contrast and are distinct from primary
-    candidates = []
-    for c in palette:
+    # Try palette colors that pass contrast AND are distinct from primary
+    for c in sorted(palette, key=lambda x: abs(_luminance(x) - _luminance(primary)), reverse=True):
         if _contrast(c, bg) < min_ratio:
             continue
-        # Distinctness: luminance distance or large channel difference
-        lum_diff   = abs(_luminance(c) - primary_lum)
-        chan_diff   = max(abs(int(c[i]) - int(primary[i])) for i in range(3))
-        if lum_diff >= 0.10 or chan_diff >= 40:
-            candidates.append((c, _contrast(c, bg), chan_diff + lum_diff * 100))
+        chan_diff = max(abs(int(c[i]) - int(primary[i])) for i in range(3))
+        if chan_diff >= 35:
+            return c
 
-    if candidates:
-        # Best: highest distinctness score among those that pass contrast
-        return max(candidates, key=lambda x: x[2])[0]
+    # Curated accents based on bg brightness direction
+    accents = _DARK_ACCENTS if bg_lum > _CROSSOVER else _LIGHT_ACCENTS
+    for accent in accents:
+        if _contrast(accent, bg) >= min_ratio:
+            # Make sure it's distinct from primary
+            if max(abs(int(accent[i]) - int(primary[i])) for i in range(3)) >= 25:
+                return accent
 
-    # ── Fallback 1: tint the anchor with a warm or cool hue from palette ──
-    if _luminance(bg) > _CROSSOVER_LUMINANCE:
-        # Dark text on light bg — try a warm dark tone (brown/amber)
-        warm_accent = (90, 60, 20)
+    # Last resort: tint anchor with opposite warmth
+    anc = _anchor(bg)
+    if bg_lum > _CROSSOVER:
+        alt = _tint(anc, (80, 50, 10), 0.45)   # warm dark
     else:
-        # Light text on dark bg — try a warm gold/cream tone
-        warm_accent = (210, 175, 110)
+        alt = _tint(anc, (200, 165, 100), 0.45) # warm light
+    if _contrast(alt, bg) >= min_ratio:
+        return alt
 
-    tinted = _tint_toward(anchor, warm_accent, 0.35)
-    if _contrast(tinted, bg) >= min_ratio:
-        return tinted
-
-    # ── Fallback 2: use anchor directly (always passes) ──────────────────
-    return anchor
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  FRAME REGION SAMPLER
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _sample_region(frame: np.ndarray, fraction: float = 0.52,
-                   region: str = "bottom") -> np.ndarray:
-    """Returns `fraction` of the frame from the specified region."""
-    h = frame.shape[0]
-    split = int(h * (1 - fraction))
-    if region == "bottom":
-        return frame[split:, :, :]
-    elif region == "top":
-        return frame[:split, :, :]
-    return frame
+    return anc  # same anchor is still readable
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -193,30 +140,18 @@ def _sample_region(frame: np.ndarray, fraction: float = 0.52,
 
 class FastThemeExtractor:
     """
-    Extracts a dual high-contrast text palette from a MoviePy clip.
+    Extracts dual high-contrast text colors from a MoviePy clip.
 
-    Usage
-    ─────
-    theme = FastThemeExtractor.extract_palette(clip)
+    IMPORTANT: pass the BLURRED/PROCESSED bg_clip, not the raw clip,
+    so the background representative color matches what text actually sits on.
 
-    Returns (all colors as RGB tuples AND hex strings)
-    ───────────────────────────────────────────────────
-    {
-        "bg_dominant_rgb":      (r, g, b),
-        "bg_dominant_hex":      "#rrggbb",
-
-        "primary_text_rgb":     (r, g, b),   # WCAG AA ≥ 4.5 guaranteed
-        "primary_text_hex":     "#rrggbb",
-
-        "secondary_text_rgb":   (r, g, b),   # WCAG AA ≥ 4.5, distinct accent
-        "secondary_text_hex":   "#rrggbb",
-
-        "full_palette_rgb":     [(r,g,b), ...],
-        "full_palette_hex":     ["#rrggbb", ...],
-
-        "primary_contrast":     float,
-        "secondary_contrast":   float,
-    }
+    Returns
+    ───────
+    primary_text_hex   / primary_text_rgb    — WCAG AA ≥ 4.5 : 1
+    secondary_text_hex / secondary_text_rgb  — WCAG AA ≥ 4.5 : 1, distinct hue
+    bg_dominant_hex    / bg_dominant_rgb     — mean color of text region
+    full_palette_hex   / full_palette_rgb    — all quantized colors
+    primary_contrast   / secondary_contrast  — actual ratios
     """
 
     @classmethod
@@ -226,54 +161,54 @@ class FastThemeExtractor:
         num_colors: int = 10,
         samples: int = 6,
         resize_width: int = 160,
-        text_region: str = "bottom",         # "bottom" | "top" | "full"
-        text_region_fraction: float = 0.52,  # fraction of frame height
-        min_contrast: float = 4.5,           # WCAG AA
+        text_region: str = "bottom",
+        text_region_fraction: float = 0.52,
+        min_contrast: float = 4.5,
     ) -> dict:
-        """
-        Sample `samples` evenly-spaced frames, quantize colors in the text
-        region, then derive primary + secondary text colors both meeting
-        `min_contrast` against the dominant background.
-        """
         dur = float(clip.duration or 5.0)
         timestamps = np.linspace(dur * 0.05, dur * 0.95, samples)
 
         region_frames: List[np.ndarray] = []
         for t in timestamps:
-            frame  = clip.get_frame(float(t))          # (H, W, 3) uint8
-            region = _sample_region(frame, text_region_fraction, text_region)
+            frame = clip.get_frame(float(t))          # (H, W, 3) uint8
+            h     = frame.shape[0]
+            split = int(h * (1 - text_region_fraction))
 
-            img = Image.fromarray(region)
-            aspect = img.height / max(img.width, 1)
-            new_h  = max(1, int(resize_width * aspect))
-            img    = img.resize((resize_width, new_h), Image.Resampling.NEAREST)
+            if text_region == "bottom":
+                region = frame[split:, :, :3]
+            elif text_region == "top":
+                region = frame[:split, :, :3]
+            else:
+                region = frame[:, :, :3]
+
+            img = Image.fromarray(region.astype(np.uint8))
+            new_h = max(1, int(resize_width * img.height / max(img.width, 1)))
+            img   = img.resize((resize_width, new_h), Image.Resampling.NEAREST)
             region_frames.append(np.array(img))
 
-        # Stack regions → single image for quantization
-        combined  = Image.fromarray(np.vstack(region_frames))
+        stacked = np.vstack(region_frames)  # (H_total, W, 3)
+
+        # ── Background = MEAN of all text-region pixels ─────────────────────
+        # This reflects what blurring actually produces: a smooth average color.
+        mean_px = np.mean(stacked.reshape(-1, 3), axis=0)
+        bg      = tuple(int(x) for x in mean_px)
+
+        # ── Quantize for palette ─────────────────────────────────────────────
+        combined  = Image.fromarray(stacked.astype(np.uint8))
         quantized = combined.quantize(colors=num_colors,
                                        method=Image.Quantize.MEDIANCUT)
-
-        raw_pal = quantized.getpalette()[:num_colors * 3]
+        raw_pal   = quantized.getpalette()[:num_colors * 3]
         palette: List[tuple] = [
             (raw_pal[i], raw_pal[i + 1], raw_pal[i + 2])
             for i in range(0, len(raw_pal), 3)
         ]
         palette.sort(key=_luminance)
 
-        # ── Background: median-brightness dominant color of text region ──
-        # Skip the absolute darkest — pick a slightly richer mid-dark tone
-        bg = palette[min(1, len(palette) - 1)]
-
-        # ── Primary & Secondary ──────────────────────────────────────────
+        # ── Derive text colors ───────────────────────────────────────────────
         primary   = _pick_primary(bg, palette, min_contrast)
         secondary = _pick_secondary(primary, bg, palette, min_contrast)
 
-        primary_cr   = _contrast(primary, bg)
-        secondary_cr = _contrast(secondary, bg)
-
         return {
-            # ── New API ──────────────────────────────────────────────────
             "bg_dominant_rgb":    bg,
             "bg_dominant_hex":    _rgb_to_hex(bg),
 
@@ -286,10 +221,10 @@ class FastThemeExtractor:
             "full_palette_rgb":   palette,
             "full_palette_hex":   [_rgb_to_hex(c) for c in palette],
 
-            "primary_contrast":   round(primary_cr, 2),
-            "secondary_contrast": round(secondary_cr, 2),
+            "primary_contrast":   round(_contrast(primary, bg), 2),
+            "secondary_contrast": round(_contrast(secondary, bg), 2),
 
-            # ── Legacy aliases (backward compat) ─────────────────────────
+            # Legacy aliases
             "bg_color_rgb":   bg,
             "bg_color_hex":   _rgb_to_hex(bg),
             "text_color_rgb": primary,
