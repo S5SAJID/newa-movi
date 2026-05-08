@@ -157,7 +157,6 @@ def create_blur_quote_video(
             "output_composite.mp4",
             fps=video_fps,
             threads=4,
-            preset="ultrafast",
         )
 
     final_video.save_frame("preview.png", t=1)
